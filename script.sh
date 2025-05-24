@@ -35,7 +35,7 @@ sleep 10  # подождать инициализацию
 # 3.1 Правим postgresql.conf и pg_hba.conf через cat
 docker exec -u root -it pg_master bash -c "cat <<'EOF' >> /var/lib/postgresql/data/postgresql.conf
 wal_level = replica
-max_wal_senders = 3
+max_wal_senders = 10
 EOF"
 
 docker exec -u root -it pg_master bash -c "cat <<'EOF' >> /var/lib/postgresql/data/pg_hba.conf
