@@ -88,6 +88,9 @@ echo "    docker exec -u postgres -it pg_master psql -d demo"
 echo "    INSERT INTO t1(msg) VALUES('state-after-step2');"
 echo "    SELECT * FROM t1;"
 echo
+# Подключаемся к pg_standby и проверяем, что там есть записи из мастер узла
+echo "    docker exec -u postgres -it pg_standby psql -d demo"
+echo "    SELECT * FROM t1;"
 
 # 7. Шаг 3: заполняем файловую систему «чужим» файлом (на хосте)
 echo "→ Step 3: Заполняем FS на master:"
