@@ -1,0 +1,46 @@
+Last login: Sun May 25 16:40:03 on ttys001
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# CREATE TABLE user_role (
+    role_id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES user_info(user_id) ON DELETE CASCADE,
+    role_name TEXT NOT NULL,
+    granted_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('hokure', 'hokure@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'moderator' FROM user_info WHERE nickname = 'hokure';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# \d
+                  List of relations
+ Schema |         Name          |   Type   |  Owner
+--------+-----------------------+----------+----------
+ public | user_info             | table    | postgres
+ public | user_info_user_id_seq | sequence | postgres
+ public | user_role             | table    | postgres
+ public | user_role_role_id_seq | sequence | postgres
+(4 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+(3 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ %

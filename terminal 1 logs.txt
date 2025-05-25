@@ -1,0 +1,574 @@
+Last login: Sun May 25 16:20:05 on ttys001
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker network create pgnet || true
+
+0e85a5ba5a9130ca8fb8e45d400a2810f4359ef351875860d2f1acef05c29a5c
+lisi4ka@MacBook-Pro-Mihail-3 ~ % mkdir -p /tmp/pg_master /tmp/pg_standby
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil create -size 500m -fs HFS+ -volname pg_master   pg_master.dmg
+
+created: /Users/lisi4ka/pg_master.dmg
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil attach pg_master.dmg -mountpoint /tmp/pg_master
+
+/dev/disk4          	GUID_partition_scheme
+/dev/disk4s1        	Apple_HFS                      	/private/tmp/pg_master
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil create -size 500m -fs HFS+ -volname pg_standby pg_standby.dmg
+
+created: /Users/lisi4ka/pg_standby.dmg
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil attach pg_standby.dmg -mountpoint /tmp/pg_standby
+
+/dev/disk5          	GUID_partition_scheme
+/dev/disk5s1        	Apple_HFS                      	/private/tmp/pg_standby
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run --rm -v /tmp/pg_master:/mnt alpine sh -c "mkdir -p /mnt/data && chown 999:999 /mnt/data"
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run --rm -v /tmp/pg_standby:/mnt alpine sh -c "mkdir -p /mnt/data && chown 999:999 /mnt/data"
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run -d --name pg_master   --network pgnet -p 15432:5432 \
+  -e POSTGRES_PASSWORD=masterpass \
+  -v /tmp/pg_master/data:/var/lib/postgresql/data \
+  postgres:15
+fd62ed4fa35d1b3393a01e01bbd914f76c98dbda26956e8d9342ab03f9992535
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u root -it pg_master bash -c "cat <<'EOF' >> /var/lib/postgresql/data/postgresql.conf
+wal_level = replica
+max_wal_senders = 10
+EOF"
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u root -it pg_master bash -c "cat <<'EOF' >> /var/lib/postgresql/data/pg_hba.conf
+host replication replicator 0.0.0.0/0 md5
+EOF"
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master pg_ctl -D /var/lib/postgresql/data reload
+
+server signaled
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -c \
+  "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replpass';"
+docker exec -u postgres -it pg_master psql -c \
+  "CREATE DATABASE blackbox;"
+CREATE ROLE
+CREATE DATABASE
+lisi4ka@MacBook-Pro-Mihail-3 ~ % cp -a /tmp/pg_master/data /tmp/pg_master_backup_data
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run --rm --name pg_basebackup --network pgnet \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15 bash -c "
+    PGPASSWORD=replpass pg_basebackup \
+      -h pg_master -U replicator \
+      -D /var/lib/postgresql/data \
+      -Fp -Xs -P
+  "
+waiting for checkpoint
+   83/30461 kB (0%), 0/1 tablespace
+30471/30471 kB (100%), 0/1 tablespace
+30471/30471 kB (100%), 1/1 tablespace
+lisi4ka@MacBook-Pro-Mihail-3 ~ % cat <<EOF >> /tmp/pg_standby/data/postgresql.conf
+primary_conninfo = 'host=pg_master port=5432 user=replicator password=replpass'
+hot_standby = on
+max_wal_senders = 10
+EOF
+lisi4ka@MacBook-Pro-Mihail-3 ~ % touch /tmp/pg_standby/data/standby.signal
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run -d --name pg_standby --network pgnet -p 15433:5432 \
+  -e POSTGRES_PASSWORD=standbypass \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15
+0043bccce92ac12e9ef71acbafb8a69cc2b429259c14b6a8bdae6968150e0014
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u root pg_standby bash -c "
+  touch /var/lib/postgresql/data/standby.signal
+  chown postgres:postgres /var/lib/postgresql/data/standby.signal
+"
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker restart pg_standby
+
+pg_standby
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# CREATE TABLE user_info (
+    user_id SERIAL PRIMARY KEY,
+    nickname TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('kindred', 'kindred@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'admin' FROM user_info WHERE nickname = 'kindred';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('lisi4ka59', 'lisi4ka59@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'lisi4ka59';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# \d
+                  List of relations
+ Schema |         Name          |   Type   |  Owner
+--------+-----------------------+----------+----------
+ public | user_info             | table    | postgres
+ public | user_info_user_id_seq | sequence | postgres
+ public | user_role             | table    | postgres
+ public | user_role_role_id_seq | sequence | postgres
+(4 rows)
+
+blackbox=# SELECT * FROM user_info;
+ user_id | nickname  |         email         |         created_at
+---------+-----------+-----------------------+----------------------------
+       1 | kindred   | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure    | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59 | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+(3 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# \d
+                  List of relations
+ Schema |         Name          |   Type   |  Owner
+--------+-----------------------+----------+----------
+ public | user_info             | table    | postgres
+ public | user_info_user_id_seq | sequence | postgres
+ public | user_role             | table    | postgres
+ public | user_role_role_id_seq | sequence | postgres
+(4 rows)
+
+blackbox=# SELECT * FROM user_info;
+ user_id | nickname  |         email         |         created_at
+---------+-----------+-----------------------+----------------------------
+       1 | kindred   | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure    | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59 | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+(3 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+(3 rows)
+
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('lisi4ka', 'lisi4ka@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'lisi4ka';
+
+COMMIT;
+BEGIN
+ERROR:  cannot execute INSERT in a read-only transaction
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % dd if=/dev/zero of=/tmp/pg_master/data/filler bs=4096 status=progress || true
+
+dd: /tmp/pg_master/data/filler: No space left on device
+
+108811+0 records in
+108810+0 records out
+445685760 bytes transferred in 0.401808 secs (1109200812 bytes/sec)
+lisi4ka@MacBook-Pro-Mihail-3 ~ % df -h /tmp/pg_master/data
+
+Filesystem      Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk4s1   500Mi   500Mi     0Bi   100%    1,3k  4,3G    0%   /private/tmp/pg_master
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('lisi4ka', 'lisi4ka@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'lisi4ka';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  the database system is in recovery mode
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby pg_ctl -D /var/lib/postgresql/data promote
+waiting for server to promote.... done
+server promoted
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('Бабка_в_танке', 'turms@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'Бабка_в_танке';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# SELECT * FROM user_info;
+ user_id |   nickname    |         email         |         created_at
+---------+---------------+-----------------------+----------------------------
+       1 | kindred       | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure        | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59     | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka       | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке | turms@example.com     | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+       4 |       4 | user      | 2025-05-25 13:51:47.360688
+      37 |      37 | user      | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker stop pg_master
+
+pg_master
+lisi4ka@MacBook-Pro-Mihail-3 ~ % sudo lsof +D /tmp/pg_master
+
+Password:
+COMMAND     PID    USER   FD   TYPE DEVICE SIZE/OFF NODE NAME
+mds         347    root   23r   DIR   1,21      170    2 /private/tmp/pg_master
+com.apple 39286 lisi4ka   24r   DIR   1,21      170    2 /private/tmp/pg_master
+login     40869    root  cwd    DIR   1,21      170    2 /private/tmp/pg_master
+lisi4ka@MacBook-Pro-Mihail-3 ~ % kill -9 39286
+lisi4ka@MacBook-Pro-Mihail-3 ~ % kill -9 40869
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil detach /tmp/pg_master
+
+"disk4" ejected.
+lisi4ka@MacBook-Pro-Mihail-3 ~ % rm pg_master.dmg
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil create -size 500m -fs HFS+ -volname pg_master   pg_master.dmg
+
+created: /Users/lisi4ka/pg_master.dmg
+lisi4ka@MacBook-Pro-Mihail-3 ~ % hdiutil attach pg_master.dmg -mountpoint /tmp/pg_master
+
+/dev/disk4          	GUID_partition_scheme
+/dev/disk4s1        	Apple_HFS                      	/private/tmp/pg_master
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker start pg_master
+
+pg_master
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby pg_dumpall \
+  > standby_changes.sql
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker cp standby_changes.sql pg_master:/tmp/standby_changes.sql
+
+Successfully copied 9.22kB to pg_master:/tmp/standby_changes.sql
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -f /tmp/standby_changes.sql
+
+SET
+SET
+SET
+psql:/tmp/standby_changes.sql:14: ERROR:  role "postgres" already exists
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
+You are now connected to database "template1" as user "postgres".
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 row)
+
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 row)
+
+SET
+SET
+SET
+SET
+CREATE DATABASE
+ALTER DATABASE
+You are now connected to database "blackbox" as user "postgres".
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 row)
+
+SET
+SET
+SET
+SET
+SET
+SET
+CREATE TABLE
+ALTER TABLE
+CREATE SEQUENCE
+ALTER TABLE
+ALTER SEQUENCE
+CREATE TABLE
+ALTER TABLE
+CREATE SEQUENCE
+ALTER TABLE
+ALTER SEQUENCE
+ALTER TABLE
+ALTER TABLE
+COPY 5
+COPY 5
+ setval
+--------
+     37
+(1 row)
+
+ setval
+--------
+     37
+(1 row)
+
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+You are now connected to database "postgres" as user "postgres".
+SET
+SET
+SET
+SET
+SET
+ set_config
+------------
+
+(1 row)
+
+SET
+SET
+SET
+SET
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# SELECT * FROM user_info;
+ user_id |   nickname    |         email         |         created_at
+---------+---------------+-----------------------+----------------------------
+       1 | kindred       | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure        | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59     | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka       | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке | turms@example.com     | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+       4 |       4 | user      | 2025-05-25 13:51:47.360688
+      37 |      37 | user      | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker stop pg_standby
+
+pg_standby
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker rm   pg_standby
+
+pg_standby
+lisi4ka@MacBook-Pro-Mihail-3 ~ % rm -rf /tmp/pg_standby/data/*
+
+zsh: sure you want to delete all 25 files in /tmp/pg_standby/data [yn]? y
+lisi4ka@MacBook-Pro-Mihail-3 ~ % cat <<EOF >> /tmp/pg_master/data/pg_hba.conf
+host  replication  replicator  172.18.0.0/16  md5
+EOF
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres pg_master pg_ctl \
+  -D /var/lib/postgresql/data reload
+server signaled
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run --rm --name pg_basebackup --network pgnet \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15 bash -c "
+    PGPASSWORD=replpass pg_basebackup \
+      -h pg_master -U replicator \
+      -D /var/lib/postgresql/data \
+      -Fp -Xs -P
+  "
+waiting for checkpoint
+30653/30653 kB (100%), 0/1 tablespace
+30653/30653 kB (100%), 1/1 tablespace
+lisi4ka@MacBook-Pro-Mihail-3 ~ % cat <<EOF >> /tmp/pg_standby/data/postgresql.conf
+primary_conninfo = 'host=pg_master port=5432 user=replicator password=replpass'
+hot_standby = on
+max_wal_senders = 10
+EOF
+lisi4ka@MacBook-Pro-Mihail-3 ~ % touch /tmp/pg_standby/data/standby.signal
+
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker run -d --name pg_standby --network pgnet -p 15433:5432 \
+  -e POSTGRES_PASSWORD=standbypass \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15
+d5bf2f679c63c50a9ea64dd1c96e2e21647433a908462957eefc8594a21ec245
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u root pg_standby bash -c "
+  touch /var/lib/postgresql/data/standby.signal
+  chown postgres:postgres /var/lib/postgresql/data/standby.signal
+"
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker restart pg_standby
+pg_standby
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# SELECT * FROM user_info;
+ user_id |   nickname    |         email         |         created_at
+---------+---------------+-----------------------+----------------------------
+       1 | kindred       | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure        | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59     | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka       | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке | turms@example.com     | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+       4 |       4 | user      | 2025-05-25 13:51:47.360688
+      37 |      37 | user      | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('Диванный_генерал', 'abrams@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'Диванный_генерал';
+
+COMMIT;
+BEGIN
+ERROR:  cannot execute INSERT in a read-only transaction
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# SELECT * FROM user_info;
+ user_id |   nickname    |         email         |         created_at
+---------+---------------+-----------------------+----------------------------
+       1 | kindred       | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure        | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59     | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka       | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке | turms@example.com     | 2025-05-25 14:03:47.754556
+(5 rows)
+
+blackbox=# BEGIN;
+
+INSERT INTO user_info(nickname, email)
+VALUES ('Диванный_генерал', 'abrams@example.com');
+
+INSERT INTO user_role(user_id, role_name)
+SELECT user_id, 'user' FROM user_info WHERE nickname = 'Диванный_генерал';
+
+COMMIT;
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+blackbox=# SELECT * FROM user_info;
+ user_id |     nickname     |         email         |         created_at
+---------+------------------+-----------------------+----------------------------
+       1 | kindred          | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure           | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59        | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka          | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке    | turms@example.com     | 2025-05-25 14:03:47.754556
+      38 | Диванный_генерал | abrams@example.com    | 2025-05-25 15:08:23.857454
+(6 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+       4 |       4 | user      | 2025-05-25 13:51:47.360688
+      37 |      37 | user      | 2025-05-25 14:03:47.754556
+      38 |      38 | user      | 2025-05-25 15:08:23.857454
+(6 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_standby psql -d blackbox
+
+psql (15.13 (Debian 15.13-1.pgdg120+1))
+Type "help" for help.
+
+blackbox=# SELECT * FROM user_info;
+ user_id |     nickname     |         email         |         created_at
+---------+------------------+-----------------------+----------------------------
+       1 | kindred          | kindred@example.com   | 2025-05-25 13:45:09.442117
+       2 | hokure           | hokure@example.com    | 2025-05-25 13:45:15.590785
+       3 | lisi4ka59        | lisi4ka59@example.com | 2025-05-25 13:45:28.990245
+       4 | lisi4ka          | lisi4ka@example.com   | 2025-05-25 13:51:47.360688
+      37 | Бабка_в_танке    | turms@example.com     | 2025-05-25 14:03:47.754556
+      38 | Диванный_генерал | abrams@example.com    | 2025-05-25 15:08:23.857454
+(6 rows)
+
+blackbox=# SELECT * FROM user_role;
+ role_id | user_id | role_name |         granted_at
+---------+---------+-----------+----------------------------
+       1 |       1 | admin     | 2025-05-25 13:45:09.442117
+       2 |       2 | moderator | 2025-05-25 13:45:15.590785
+       3 |       3 | user      | 2025-05-25 13:45:28.990245
+       4 |       4 | user      | 2025-05-25 13:51:47.360688
+      37 |      37 | user      | 2025-05-25 14:03:47.754556
+      38 |      38 | user      | 2025-05-25 15:08:23.857454
+(6 rows)
+
+blackbox=# \q
+lisi4ka@MacBook-Pro-Mihail-3 ~ %
