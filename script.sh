@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+# 00. Запустить докер
+
 # 0. Создаём сеть для контейнеров (если ещё нет)
 docker network create pgnet || true
 
@@ -49,8 +51,8 @@ docker exec -u postgres -it pg_master pg_ctl -D /var/lib/postgresql/data reload
 docker exec -u postgres -it pg_master psql -c \
   "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replpass';"
 docker exec -u postgres -it pg_master psql -c \
-  "CREATE DATABASE demo;"
-docker exec -u postgres -it pg_master psql -d demo -c \
+  "CREATE DATABASE blackbox;"
+docker exec -u postgres -it pg_master psql -d blackbox -c \
   "CREATE TABLE t1(id serial PRIMARY KEY, msg text);"
 
 # 4. Сохраняем бэкап master-data для отката
@@ -84,12 +86,12 @@ sleep 5
 # 6. Шаг 2: «следы» на мастере
 echo
 echo "→ Step 2: Подключитесь к master и выполните read/write:"
-echo "    docker exec -u postgres -it pg_master psql -d demo"
+echo "    docker exec -u postgres -it pg_master psql -d blackbox"
 echo "    INSERT INTO t1(msg) VALUES('state-after-step2');"
 echo "    SELECT * FROM t1;"
 echo
 # Подключаемся к pg_standby и проверяем, что там есть записи из мастер узла
-echo "    docker exec -u postgres -it pg_standby psql -d demo"
+echo "    docker exec -u postgres -it pg_standby psql -d blackbox"
 echo "    SELECT * FROM t1;"
 
 # 7. Шаг 3: заполняем файловую систему «чужим» файлом (на хосте)
@@ -100,9 +102,9 @@ echo
 # Снова подключаемся к основному узлу, который хотим испортить и он должен либо не подключаться
 # Либо, если подключился, то понаинсерти туда строчек, выйди и тогда он точно должен перестать работать
 # Что-то типа такого должно получиться
-# lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d demo
+# lisi4ka@MacBook-Pro-Mihail-3 ~ % docker exec -u postgres -it pg_master psql -d blackbox
 # psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed: FATAL:  the database system is in recovery mode
-docker exec -u postgres -it pg_master psql -d demo
+docker exec -u postgres -it pg_master psql -d blackbox
 echo "    INSERT INTO t1(msg) VALUES('state-after-step2');"
 
 # 8. Шаг 4: промотирование standby + запись туда
@@ -110,7 +112,7 @@ echo "→ Step 4: Промотируйте standby и запишите в нег
 # Не должен сработать, резервный узел ридонли
 # echo "    docker exec -u postgres -it pg_standby bash -c \"touch /var/lib/postgresql/data/failover.trigger\""
 echo "    sleep 5"
-echo "    docker exec -u postgres -it pg_standby psql -d demo"
+echo "    docker exec -u postgres -it pg_standby psql -d blackbox"
 echo "    docker exec -u postgres -it pg_standby pg_ctl -D /var/lib/postgresql/data promote"
 echo "    INSERT INTO t1(msg) VALUES('write-on-standby');"
 echo
@@ -125,8 +127,8 @@ dd if=/dev/zero of=/tmp/pg_master/data/filler bs=4096 count=1 status=progress ||
 # cp -a /tmp/pg_master_backup_data/* /tmp/pg_master/data/ # Вот на этом этапе у меня перестало получаться, потому что не удалился мусор
 docker start pg_master
 sleep 5
-# попробовать убрать -d demo
-docker exec -u postgres -it pg_standby pg_dump -d demo -C --table=t1 \
+# попробовать убрать -d blackbox
+docker exec -u postgres -it pg_standby pg_dump -d blackbox -C --table=t1 \
   > standby_changes.sql
 docker cp standby_changes.sql pg_master:/tmp/standby_changes.sql
 docker exec -u postgres -it pg_master psql -f /tmp/standby_changes.sql
@@ -257,7 +259,7 @@ docker restart pg_standby
 # Финальная проверка
 echo
 echo "→ Финальная проверка на master:"
-docker exec -u postgres -it pg_master psql -d demo -c "SELECT * FROM t1;"
+docker exec -u postgres -it pg_master psql -d blackbox -c "SELECT * FROM t1;"
 
 
 
@@ -270,7 +272,13 @@ docker rm   pg_master pg_standby
 # 2. (Опционально) Удалить Docker-сеть, если она больше не нужна
 docker network rm pgnet
 
-# 3. Отмонтировать HFS+-тома и удалить их образы
+sudo lsof +D /tmp/pg_master
+sudo lsof +D /tmp/pg_standby
+
+# Убиваем процессы, найденные выше (скорее всего понадобиться убить только один процесс)
+kill -9 1234
+
+# 3. Отмонтировать HFS+-тома и удалить их образы (если открыт в это время десктопный докер, то он сдохнет)
 hdiutil detach /tmp/pg_master
 hdiutil detach /tmp/pg_standby
 rm pg_master.dmg pg_standby.dmg
