@@ -107,7 +107,8 @@ echo "    INSERT INTO t1(msg) VALUES('state-after-step2');"
 
 # 8. Шаг 4: промотирование standby + запись туда
 echo "→ Step 4: Промотируйте standby и запишите в него:"
-echo "    docker exec -u postgres -it pg_standby bash -c \"touch /var/lib/postgresql/data/failover.trigger\""
+# Не должен сработать, резервный узел ридонли
+# echo "    docker exec -u postgres -it pg_standby bash -c \"touch /var/lib/postgresql/data/failover.trigger\""
 echo "    sleep 5"
 echo "    docker exec -u postgres -it pg_standby psql -d demo"
 echo "    docker exec -u postgres -it pg_standby pg_ctl -D /var/lib/postgresql/data promote"
@@ -117,16 +118,165 @@ echo
 # 9. Шаг 5: откат master + перенос изменений из standby
 echo "→ Step 5: Восстанавливаем master и применяем изменения из standby..."
 docker stop pg_master
+# В целом необязательно, но имитируем что у нас утерян мастер узел
 rm -rf /tmp/pg_master/data/*
-cp -a /tmp/pg_master_backup_data/* /tmp/pg_master/data/ # Вот на этом этапе у меня перестало получаться, потому что не удалился мусор
+# Очищаем филлеры
+dd if=/dev/zero of=/tmp/pg_master/data/filler bs=4096 count=1 status=progress || true
+# cp -a /tmp/pg_master_backup_data/* /tmp/pg_master/data/ # Вот на этом этапе у меня перестало получаться, потому что не удалился мусор
 docker start pg_master
 sleep 5
-docker exec -u postgres -it pg_standby pg_dump -d demo --table=t1 --data-only \
+# попробовать убрать -d demo
+docker exec -u postgres -it pg_standby pg_dump -d demo -C --table=t1 \
   > standby_changes.sql
 docker cp standby_changes.sql pg_master:/tmp/standby_changes.sql
-docker exec -u postgres -it pg_master psql -d demo -f /tmp/standby_changes.sql
+docker exec -u postgres -it pg_master psql -f /tmp/standby_changes.sql
+
+
+# Восстановление резервного узла в исходное состояние
+
+# 1. Остановить и удалить старый контейнер standby
+docker stop pg_standby
+docker rm   pg_standby
+
+# 2. Очистить данные standby на хосте
+rm -rf /tmp/pg_standby/data/*
+
+cat <<EOF >> /tmp/pg_master/data/pg_hba.conf
+# разрешить репликацию из Docker-сети 172.18.0.0/16
+host  replication  replicator  172.18.0.0/16  md5
+EOF
+
+# 2. Перезагрузить конфиг внутри контейнера-мастера
+docker exec -u postgres pg_master pg_ctl \
+  -D /var/lib/postgresql/data reload
+
+# попробовать выполнить без этого шага
+docker exec -u postgres -it pg_master psql -c \
+  "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'replpass';"
+
+
+
+# 3. Получаем свежий слепок от мастера через pg_basebackup
+docker run --rm --name pg_basebackup --network pgnet \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15 bash -c "
+    PGPASSWORD=replpass pg_basebackup \
+      -h pg_master -U replicator \
+      -D /var/lib/postgresql/data \
+      -Fp -Xs -P
+  "
+
+# 4. Настраиваем standby mode: правим конфиг и создаём сигнал
+cat <<EOF >> /tmp/pg_standby/data/postgresql.conf
+primary_conninfo = 'host=pg_master port=5432 user=replicator password=replpass'
+hot_standby = on
+max_wal_senders = 10
+EOF
+
+# создаём пустой файл standby.signal
+touch /tmp/pg_standby/data/standby.signal
+
+# делаем владельцем postgres (UID 999)
+# chown 999:999 /tmp/pg_standby/data/standby.signal
+
+# 5. Запускаем новый контейнер-standby
+docker run -d --name pg_standby --network pgnet -p 15433:5432 \
+  -e POSTGRES_PASSWORD=standbypass \
+  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+  postgres:15
+
+docker exec -u root pg_standby bash -c "
+  touch /var/lib/postgresql/data/standby.signal
+  chown postgres:postgres /var/lib/postgresql/data/standby.signal
+"
+
+docker restart pg_standby
+
+## 3. Снять свежий base backup с мастера (порт 15432)
+#docker run --rm --name pg_basebackup --network pgnet \
+#  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+#  postgres:15 bash -c "
+#    export PGPASSWORD=replpass
+#    pg_basebackup \
+#      -h pg_master -p 5432 \
+#      -U replicator \
+#      -D /var/lib/postgresql/data \
+#      -Fp -Xs -P
+#  "
+#
+## 4. Прописать параметры репликации в postgresql.conf
+#cat <<EOF >> /tmp/pg_standby/data/postgresql.conf
+#primary_conninfo = 'host=pg_master port=5432 user=replicator password=replpass'
+#hot_standby     = on
+#max_wal_senders = 10
+#EOF
+#
+#docker run -d --name pg_standby --network pgnet -p 15433:5432 \
+#  -e POSTGRES_PASSWORD=standbypass \
+#  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+#  postgres:15
+#
+#docker start pg_standby
+## 5. Настраиваем standby через pg_basebackup (PG15+)
+#docker exec -u root pg_standby bash -c "rm -rf /var/lib/postgresql/data/*"
+#
+#docker run --rm --name pg_basebackup --network pgnet \
+#  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+#  postgres:15 bash -c "
+#    PGPASSWORD=replpass pg_basebackup \
+#      -h pg_master -U replicator \
+#      -D /var/lib/postgresql/data -Fp -Xs -P
+#  "
+#docker start pg_standby
+#
+## Правим postgresql.conf и создаём standby.signal
+#docker exec -u root pg_standby bash -c "cat <<'EOF' >> /var/lib/postgresql/data/postgresql.conf
+#primary_conninfo = 'host=pg_master port=5432 user=replicator password=replpass'
+#hot_standby = on
+#max_wal_senders = 10
+#EOF
+#touch /var/lib/postgresql/data/standby.signal
+#chown postgres:postgres /var/lib/postgresql/data/standby.signal
+#"
+
+## 5. Запустить новый контейнер-standby
+#docker run -d --name pg_standby --network pgnet -p 15433:5432 \
+#  -e POSTGRES_PASSWORD=standbypass \
+#  -v /tmp/pg_standby/data:/var/lib/postgresql/data \
+#  postgres:15
+#
+## 6. Внутри контейнера создать сигнал standby
+#docker exec -u root pg_standby bash -c "
+#  touch /var/lib/postgresql/data/standby.signal
+#  chown postgres:postgres /var/lib/postgresql/data/standby.signal
+#"
+#
+## 7. Перезапустить standby и проверить логи
+#docker restart pg_standby
 
 # Финальная проверка
 echo
 echo "→ Финальная проверка на master:"
 docker exec -u postgres -it pg_master psql -d demo -c "SELECT * FROM t1;"
+
+
+
+# КОМАНДЫ ДЛЯ СНОСА КОНТЕЙНЕРОВ
+
+# 1. Остановить и удалить контейнеры
+docker stop pg_master pg_standby
+docker rm   pg_master pg_standby
+
+# 2. (Опционально) Удалить Docker-сеть, если она больше не нужна
+docker network rm pgnet
+
+# 3. Отмонтировать HFS+-тома и удалить их образы
+hdiutil detach /tmp/pg_master
+hdiutil detach /tmp/pg_standby
+rm pg_master.dmg pg_standby.dmg
+
+# 4. Удалить каталоги с данными на хосте
+rm -rf /tmp/pg_master /tmp/pg_standby
+
+# 5. (Опционально) Убедиться, что нет «зависших» томов
+docker volume prune  # и ответить «y», если предложит удалить все неиспользуемые тома
